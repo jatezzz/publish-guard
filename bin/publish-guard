@@ -1,0 +1,263 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/*
+ * publish-guard: run it before you push a public repository or deploy a site. It fails when the published material
+ * could leak something you meant to keep out of it: names on a private list, location data inside photos, an AI
+ * co-author on your commits, or a link to a host you never meant to point at.
+ *
+ * Exit status: 0 clean, 1 findings, 2 usage or setup error.
+ */
+
+require dirname(__DIR__) . '/src/Guard.php';
+
+use PublishGuard\Guard;
+
+const USAGE = <<<TXT
+usage: publish-guard [options]
+  --repo DIR            repository to check (default: current directory)
+  --terms-file FILE     private term list (or PUBLISH_GUARD_TERMS with the list itself)
+  --pages DIR           built HTML to check as rendered pages (repeatable)
+  --url URL             a rendered page to fetch and check (repeatable)
+  --allowed-hosts LIST  comma-separated external hosts pages may link to (default: any, links not checked)
+  --fetch-hosts LIST    of those, hosts whose linked pages are read one hop deep with --fetch
+  --fetch               check the linked pages on --fetch-hosts for terms (~entries only warn there)
+  --overlap FILE        report 8-word phrases your pages share with the URLs listed in FILE
+  --authors LIST        allowed author e-mails (or PUBLISH_GUARD_AUTHORS); enables the commit check
+  --committers LIST     extra allowed committer e-mails (default: noreply@github.com)
+  --allow-missing-terms run without a term list (term checks are skipped)
+  --help
+TXT;
+
+$options = getopt('', ['repo:', 'terms-file:', 'pages:', 'url:', 'allowed-hosts:', 'fetch-hosts:', 'fetch', 'overlap:',
+    'authors:', 'committers:', 'allow-missing-terms', 'help']);
+if (isset($options['help'])) {
+    fwrite(STDOUT, USAGE . "\n");
+    exit(0);
+}
+$list = static fn (string $key): array => array_values(array_filter(array_map('trim', (array) ($options[$key] ?? []))));
+$csv = static fn (?string $value): array => array_values(array_filter(array_map(static fn (string $s): string => strtolower(trim($s)), explode(',', (string) $value))));
+
+$root = realpath((string) ($options['repo'] ?? getcwd()));
+if ($root === false || !is_dir($root)) {
+    fwrite(STDERR, "publish-guard: --repo is not a directory\n");
+    exit(2);
+}
+
+$errors = 0;
+$warnings = 0;
+$fail = static function (string $m) use (&$errors): void { $errors++; fwrite(STDOUT, "FAIL  {$m}\n"); };
+$warn = static function (string $m) use (&$warnings): void { $warnings++; fwrite(STDOUT, "WARN  {$m}\n"); };
+$info = static fn (string $m) => fwrite(STDOUT, "ok    {$m}\n");
+$git = static function (string $args) use ($root): string {
+    $out = shell_exec('git -C ' . escapeshellarg($root) . ' ' . $args . ' 2>/dev/null');
+
+    return is_string($out) ? $out : '';
+};
+$fetch = static function (string $url): ?string {
+    $context = stream_context_create(['http' => ['timeout' => 15, 'follow_location' => 1, 'max_redirects' => 3,
+        'ignore_errors' => true, 'user_agent' => 'publish-guard']]);
+    $body = @file_get_contents($url, false, $context, 0, 4 * 1024 * 1024);
+
+    return $body === false ? null : $body;
+};
+
+// ---------- Term list ----------
+$raw = getenv('PUBLISH_GUARD_TERMS') ?: '';
+if (isset($options['terms-file'])) {
+    $raw = (string) @file_get_contents((string) $options['terms-file']);
+    if ($raw === '') {
+        fwrite(STDERR, "publish-guard: cannot read the terms file\n");
+        exit(2);
+    }
+}
+try {
+    $terms = Guard::parseTerms($raw);
+} catch (InvalidArgumentException $e) {
+    fwrite(STDERR, 'publish-guard: ' . $e->getMessage() . "\n");
+    exit(2);
+}
+if ($terms === []) {
+    if (!isset($options['allow-missing-terms'])) {
+        fwrite(STDERR, "publish-guard: no term list (pass --terms-file, set PUBLISH_GUARD_TERMS, or --allow-missing-terms)\n");
+        exit(2);
+    }
+    $warn('no term list given; term checks skipped');
+}
+
+// ---------- Rendered pages ----------
+$pages = [];
+foreach ($list('pages') as $dir) {
+    $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS));
+    foreach ($it as $file) {
+        if (preg_match('/\.(html?|xml|txt)$/i', $file->getFilename())) {
+            $pages[(string) $file] = (string) file_get_contents((string) $file);
+        }
+    }
+}
+foreach ($list('url') as $url) {
+    $body = $fetch($url);
+    $body === null ? $fail('could not fetch page ' . Guard::safe($url, $terms)) : $pages[$url] = $body;
+}
+
+// ---------- 1. Terms ----------
+$tracked = array_values(array_filter(explode("\0", $git('ls-files -z'))));
+if ($tracked === []) {
+    $warn('git ls-files returned nothing (is --repo a git repository?)');
+}
+if ($terms !== []) {
+    $hits = 0;
+    $report = static function (string $where, string $text) use ($terms, $fail, &$hits): void {
+        foreach (Guard::matches($text, $terms) as $match) {
+            $hits++;
+            $fail("term #{$match['line']} in " . Guard::safe($where, $terms));
+        }
+    };
+    foreach ($tracked as $path) {
+        $report('path ' . $path, $path);
+        if (preg_match('/\.(woff2?|ttf|otf)$/i', $path)) {
+            continue; // font binaries
+        }
+        $data = @file_get_contents($root . '/' . $path);
+        if ($data === false) {
+            continue;
+        }
+        if (str_contains($data, "\0")) {
+            // Raster images are covered by the metadata check; their compressed bytes only match short terms by chance.
+            if (preg_match('/\.(png|jpe?g|webp|gif|avif)$/i', $path)) {
+                continue;
+            }
+            preg_match_all('/[\x20-\x7E]{4,}/', $data, $runs); // PDFs, video: metadata is plain text
+            $report($path . ' (metadata)', implode("\n", $runs[0]));
+            continue;
+        }
+        foreach (explode("\n", $data) as $n => $line) {
+            if ($line !== '') {
+                $report($path . ':' . ($n + 1), $line);
+            }
+        }
+    }
+    foreach (Guard::records($git('log --all ' . escapeshellarg('--format=%H%x1f%B%x00'))) as $record) {
+        [$hash, $message] = array_pad(explode("\x1f", $record, 2), 2, '');
+        $report('commit ' . substr($hash, 0, 10) . ' message', $message);
+    }
+    foreach (array_filter(explode("\n", $git('for-each-ref ' . escapeshellarg('--format=%(refname:short)')))) as $ref) {
+        $report('ref ' . $ref, $ref);
+    }
+    foreach ($pages as $where => $body) {
+        $report('page ' . $where, $body);
+    }
+    if ($hits === 0) {
+        $info(count($terms) . ' entries checked against ' . count($tracked) . ' tracked files, commit messages and ' . count($pages) . ' pages');
+    }
+}
+
+// ---------- 2. Image metadata ----------
+$dirty = 0;
+$images = array_filter($tracked, static fn (string $p): bool => (bool) preg_match('/\.(png|jpe?g|webp|gif|avif|svg)$/i', $p));
+foreach ($images as $path) {
+    $found = Guard::imageMetadata((string) @file_get_contents($root . '/' . $path), pathinfo($path, PATHINFO_EXTENSION));
+    if ($found !== null) {
+        $dirty++;
+        $fail(Guard::safe($path, $terms) . " carries metadata ({$found}); strip it before publishing");
+    }
+}
+if ($dirty === 0) {
+    $info(count($images) . ' tracked images without EXIF, XMP, IPTC or text metadata');
+}
+
+// ---------- 3. Commit authors ----------
+$authors = $csv($options['authors'] ?? (getenv('PUBLISH_GUARD_AUTHORS') ?: null));
+if ($authors !== []) {
+    $committers = array_merge($authors, $csv($options['committers'] ?? 'noreply@github.com'));
+    $bad = 0;
+    $commits = Guard::records($git('log --all ' . escapeshellarg('--format=%H%x1f%ae%x1f%ce%x1f%(trailers:key=Co-authored-by,valueonly,separator=%x1e)%x00')));
+    foreach ($commits as $record) {
+        [$hash, $author, $committer, $co] = array_pad(explode("\x1f", $record), 4, '');
+        $short = substr($hash, 0, 10);
+        if (!in_array(strtolower($author), $authors, true)) {
+            $bad++;
+            $fail("commit {$short}: author address is not an allowed one");
+        }
+        if (!in_array(strtolower($committer), $committers, true)) {
+            $bad++;
+            $fail("commit {$short}: committer address is not an allowed one");
+        }
+        if (trim($co) !== '') {
+            $bad++;
+            $fail("commit {$short}: has a co-author trailer");
+        }
+    }
+    if ($bad === 0) {
+        $info(count($commits) . ' commits with an allowed author and committer, and no co-author trailers');
+    }
+}
+
+// ---------- 4. Outbound links ----------
+$allowed = $csv($options['allowed-hosts'] ?? null);
+$fetchHosts = $csv($options['fetch-hosts'] ?? null);
+$external = [];
+if ($allowed !== [] && $pages !== []) {
+    $own = array_filter(array_map(static fn (string $w): string => strtolower((string) parse_url($w, PHP_URL_HOST)), array_keys($pages)));
+    $before = $errors;
+    foreach ($pages as $where => $body) {
+        foreach (Guard::links($body) as $url) {
+            $host = strtolower((string) parse_url($url, PHP_URL_HOST));
+            if ($host === '' || in_array($host, $own, true)) {
+                continue;
+            }
+            if (!in_array($host, $allowed, true)) {
+                $fail('unexpected external host ' . Guard::safe($host, $terms) . ' on ' . Guard::safe($where, $terms));
+            } elseif (in_array($host, $fetchHosts, true)) {
+                $external[$url] = true;
+            }
+        }
+    }
+    if ($errors === $before) {
+        $info('outbound links point only to allowed hosts');
+    }
+}
+
+// ---------- 5. One hop ----------
+if (isset($options['fetch']) && $terms !== []) {
+    foreach (array_keys($external) as $url) {
+        $body = $fetch($url);
+        if ($body === null) {
+            $warn('could not fetch ' . Guard::safe($url, $terms));
+            continue;
+        }
+        $found = Guard::matches($body, $terms);
+        foreach ($found as $match) {
+            $message = "term #{$match['line']} on linked page " . Guard::safe($url, $terms);
+            $match['soft'] ? $warn($message) : $fail($message);
+        }
+        if ($found === []) {
+            $info('linked page clean: ' . Guard::safe($url, $terms));
+        }
+    }
+}
+
+// ---------- 6. Shared phrases ----------
+if (isset($options['overlap'])) {
+    $sites = array_values(array_filter(array_map('trim', file((string) $options['overlap']) ?: []),
+        static fn (string $l): bool => $l !== '' && !str_starts_with($l, '#')));
+    $ours = [];
+    foreach ($pages as $body) {
+        $ours += Guard::shingles(Guard::visibleWords($body));
+    }
+    foreach ($sites as $i => $url) {
+        $body = $fetch($url);
+        if ($body === null) {
+            $warn('site #' . ($i + 1) . ': could not fetch');
+            continue;
+        }
+        $shared = count(array_intersect_key($ours, Guard::shingles(Guard::visibleWords($body))));
+        $shared > 0 ? $warn('site #' . ($i + 1) . ": {$shared} shared 8-word phrases")
+                    : $info('site #' . ($i + 1) . ': no shared 8-word phrases');
+    }
+}
+
+fwrite(STDOUT, sprintf("\n%d failure(s), %d warning(s)\n", $errors, $warnings));
+exit($errors > 0 ? 1 : 0);
